@@ -32,19 +32,6 @@ log_warning() {
     echo "[WARNING] $1" >> "$LOG_FILE"
 }
 
-# Cleanup function
-cleanup() {
-    log_warning "An error occurred. Cleaning up..."
-    # Don't remove the entire .wine64 directory as it might contain other applications
-    # Instead, just remove the temporary installer
-    if [ -f "$USER_HOME/.wine64/drive_c/temp/ncinstaller.exe" ]; then
-        rm -f "$USER_HOME/.wine64/drive_c/temp/ncinstaller.exe"
-    fi
-}
-
-# Add error handling at the beginning
-trap cleanup ERR
-
 # Function to check if a package is installed
 package_installed() {
     pacman -Q "$1" >/dev/null 2>&1
@@ -118,11 +105,24 @@ fi
 
 # Install required packages
 log "Installing required packages..."
-PACKAGES=("wine" "wine-mono" "wine-gecko" "xdg-desktop-portal-hyprland" "xdg-utils")
+PACKAGES=("wine" "wine-mono" "wine-gecko" "xdg-desktop-portal-hyprland" "xdg-utils" "gnutls" "lib32-gnutls")
 
 for pkg in "${PACKAGES[@]}"; do
-    install_package "$pkg" || exit 1
+    install_package "$pkg" || {
+        if [[ "$pkg" == "lib32-gnutls" ]]; then
+            log_warning "Failed to install lib32-gnutls. This is optional and may not affect installation."
+        else
+            exit 1
+        fi
+    }
 done
+
+# Clean up any existing Wine prefix if requested
+if [ "$1" == "--clean" ]; then
+    log "Cleaning up existing Wine prefix..."
+    rm -rf "$USER_HOME/.wine64"
+    log "Wine prefix cleaned up."
+fi
 
 # Initialize Wine properly
 log "Initializing Wine (64-bit)..."
@@ -171,6 +171,40 @@ if [[ ":$PATH:" != *":$USER_HOME/.local/bin:"* ]]; then
     export PATH="$USER_HOME/.local/bin:$PATH"
 fi
 
+# Install NinjaRemote using local installer
+log "Installing NinjaRemote using local installer..."
+# Copy installer to Wine drive
+create_dir_if_not_exists "$USER_HOME/.wine64/drive_c/temp"
+cp "$SCRIPT_DIR/ncinstaller.exe" "$USER_HOME/.wine64/drive_c/temp/"
+chmod +x "$USER_HOME/.wine64/drive_c/temp/ncinstaller.exe"
+
+# Run installer from Wine C: drive - try without silent option first
+log "Running installer in interactive mode..."
+WINEPREFIX="$USER_HOME/.wine64" WINEARCH=win64 wine "$USER_HOME/.wine64/drive_c/temp/ncinstaller.exe" >> "$LOG_FILE" 2>&1
+INSTALL_STATUS=$?
+
+if [ $INSTALL_STATUS -ne 0 ]; then
+    log_error "Installation failed with exit code $INSTALL_STATUS. Check $LOG_FILE for details."
+    log_warning "Please try installing manually by running:"
+    log_warning "WINEPREFIX=\"$USER_HOME/.wine64\" WINEARCH=win64 wine \"$USER_HOME/.wine64/drive_c/temp/ncinstaller.exe\""
+    exit 1
+fi
+
+# Wait a moment for any background processes to complete
+sleep 2
+
+# Find the actual location of ncplayer.exe
+log "Locating NinjaRemote executable..."
+NCPLAYER_PATH=$(find "$USER_HOME/.wine64" -name "ncplayer.exe" | head -n 1)
+
+if [ -z "$NCPLAYER_PATH" ]; then
+    log_error "Could not find NinjaRemote executable. Installation may have failed."
+    log_warning "Please try running the script again or install manually."
+    exit 1
+fi
+
+log "Found NinjaRemote executable at: $NCPLAYER_PATH"
+
 # Create desktop entry file
 DESKTOP_FILE="$APPLICATIONS_DIR/ninja-remote.desktop"
 log "Creating desktop entry file: $DESKTOP_FILE"
@@ -179,12 +213,12 @@ cat > "$DESKTOP_FILE" << EOF
 #!/usr/bin/env xdg-open
 [Desktop Entry]
 Name=NinjaOne Remote
-Exec=bash -c 'WINEPREFIX="$USER_HOME/.wine64" WINEARCH=win64 wine "$USER_HOME/.wine64/drive_c/Program Files/NinjaRemote/ncplayer.exe" "%u"'
+Exec=bash -c 'WINEPREFIX="$USER_HOME/.wine64" WINEARCH=win64 wine "$NCPLAYER_PATH" "%u"'
 Type=Application
 Terminal=false
 MimeType=x-scheme-handler/ninjarmm;
 Name[en_US]=NinjaOne Remote
-Icon=$USER_HOME/.wine64/drive_c/Program\ Files/NinjaRemote/ncplayer.exe
+Icon=$NCPLAYER_PATH
 EOF
 
 chmod +x "$DESKTOP_FILE"
@@ -196,31 +230,11 @@ log "Creating launcher script for Hyprland: $LAUNCHER_SCRIPT"
 
 cat > "$LAUNCHER_SCRIPT" << EOF
 #!/bin/bash
-WINEPREFIX="$USER_HOME/.wine64" WINEARCH=win64 wine "$USER_HOME/.wine64/drive_c/Program Files/NinjaRemote/ncplayer.exe"
+WINEPREFIX="$USER_HOME/.wine64" WINEARCH=win64 wine "$NCPLAYER_PATH" 2>/dev/null
 EOF
 
 chmod +x "$LAUNCHER_SCRIPT"
 log "Launcher script created successfully."
-
-# Install NinjaRemote using local installer
-log "Installing NinjaRemote using local installer..."
-# Copy installer to Wine drive
-create_dir_if_not_exists "$USER_HOME/.wine64/drive_c/temp"
-cp "$SCRIPT_DIR/ncinstaller.exe" "$USER_HOME/.wine64/drive_c/temp/"
-chmod +x "$USER_HOME/.wine64/drive_c/temp/ncinstaller.exe"
-
-# Run installer from Wine C: drive
-WINEPREFIX="$USER_HOME/.wine64" WINEARCH=win64 wine "C:\\temp\\ncinstaller.exe" /S >> "$LOG_FILE" 2>&1
-if [ $? -ne 0 ]; then
-    # Try alternative installation method
-    log "Trying alternative installation method..."
-    WINEPREFIX="$USER_HOME/.wine64" WINEARCH=win64 wine cmd /c "start /wait C:\\temp\\ncinstaller.exe /S" >> "$LOG_FILE" 2>&1
-    if [ $? -ne 0 ]; then
-        log_error "Failed to install NinjaRemote. Check $LOG_FILE for details."
-        exit 1
-    fi
-fi
-log "NinjaRemote installed successfully."
 
 # Configure Hyprland integration
 log "Setting up Hyprland integration..."
@@ -302,5 +316,7 @@ log "1. You can now launch NinjaOne Remote from rofi/dmenu by typing 'ninja-remo
 log "2. To add a keyboard shortcut, add the following line to your hyprland.conf:"
 log "   bind = SUPER, N, exec, ninja-remote"
 log "3. Restart Hyprland for the configuration to take effect"
+
+log "NinjaOne Remote is now installed at: $NCPLAYER_PATH"
 
 exit 0
